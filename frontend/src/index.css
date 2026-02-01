@@ -54,6 +54,17 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
+input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 6px 0;
+  padding: 0.6em 0.8em;
+  border-radius: 8px;
+  border: 1px solid #3a3a3a;
+  font: inherit;
+  background-color: transparent;
+}
+
 @media (prefers-color-scheme: light) {
   :root {
     color: #213547;
@@ -64,5 +75,8 @@ button:focus-visible {
   }
   button {
     background-color: #f9f9f9;
+  }
+  input {
+    border-color: #d1d5db;
   }
 }

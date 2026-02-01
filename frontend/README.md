@@ -2,12 +2,12 @@
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Telegram login (frontend)
+## PWA + Web Push (frontend)
 
-1) Set your bot username (without `@`) in `frontend/.env.local`:
+1) Point the frontend at your backend API in `frontend/.env.local`:
 
 ```bash
-VITE_TELEGRAM_BOT_USERNAME=YourBotUsername
+VITE_API_BASE_URL=http://localhost:8000
 ```
 
 2) Start the frontend:
@@ -16,8 +16,11 @@ VITE_TELEGRAM_BOT_USERNAME=YourBotUsername
 npm run dev
 ```
 
-This project currently uses the Telegram login widget `data-onauth` callback to display “Logged in as @username (ID: user_id)” in the UI.
-If you need real authentication (secure sessions + protected API access), you must verify the Telegram login payload on a backend (recommended).
+3) In the UI, register/login, then click “Enable push”.
+
+Notes:
+- Push requires HTTPS (or `localhost`). iOS push requires installing the PWA (“Add to Home Screen”) and iOS 16.4+.
+- The backend must be configured with VAPID keys to actually send push notifications.
 
 Currently, two official plugins are available:
 
