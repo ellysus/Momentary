@@ -72,6 +72,43 @@ class Database:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    is_admin INTEGER NOT NULL,
+                    is_banned INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS push_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    endpoint TEXT UNIQUE NOT NULL,
+                    p256dh TEXT NOT NULL,
+                    auth TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS prompt_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     prompt_time TEXT NOT NULL,
@@ -230,6 +267,140 @@ class Database:
             self._conn.execute("DELETE FROM photos WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         return True
+
+    # Accounts (web / PWA)
+
+    def create_account(self, username: str, password_hash: str, is_admin: bool) -> int:
+        now = datetime.now().astimezone().isoformat()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO accounts (username, password_hash, is_admin, is_banned, created_at)
+                VALUES (?, ?, ?, 0, ?)
+                """,
+                (username, password_hash, 1 if is_admin else 0, now),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM accounts WHERE username = ?",
+                (username,),
+            ).fetchone()
+            return int(row["id"])
+
+    def get_account_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM accounts WHERE username = ?",
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_account_by_id(self, account_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_account_banned(self, account_id: int, is_banned: bool) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE accounts SET is_banned = ? WHERE id = ?",
+                (1 if is_banned else 0, account_id),
+            )
+
+    def list_accounts_with_photo_counts(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    a.id,
+                    a.username,
+                    a.is_admin,
+                    a.is_banned,
+                    a.created_at,
+                    COUNT(ap.id) AS photo_count
+                FROM accounts a
+                LEFT JOIN account_photos ap ON ap.account_id = a.id
+                GROUP BY a.id
+                ORDER BY a.id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_accounts(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()
+        return int(row["n"]) if row else 0
+
+    def count_account_photos_total(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM account_photos"
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def add_account_photo(self, account_id: int, timestamp: str, object_key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO account_photos (account_id, timestamp, object_key)
+                VALUES (?, ?, ?)
+                """,
+                (account_id, timestamp, object_key),
+            )
+
+    def list_account_photos(self, account_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, timestamp, object_key
+                FROM account_photos
+                WHERE account_id = ?
+                ORDER BY timestamp DESC
+                """,
+                (account_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # Web Push subscriptions
+
+    def upsert_push_subscription(
+        self, account_id: int, endpoint: str, p256dh: str, auth: str
+    ) -> None:
+        now = datetime.now().astimezone().isoformat()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO push_subscriptions (account_id, endpoint, p256dh, auth, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(endpoint) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    p256dh = excluded.p256dh,
+                    auth = excluded.auth,
+                    updated_at = excluded.updated_at
+                """,
+                (account_id, endpoint, p256dh, auth, now, now),
+            )
+
+    def delete_push_subscription(self, endpoint: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM push_subscriptions WHERE endpoint = ?",
+                (endpoint,),
+            )
+
+    def list_push_subscriptions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT ps.*, a.username, a.is_banned
+                FROM push_subscriptions ps
+                JOIN accounts a ON a.id = ps.account_id
+                ORDER BY ps.id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_user(self, telegram_id: int, username: Optional[str]) -> int:
         now = datetime.now().astimezone().isoformat()

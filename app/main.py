@@ -7,16 +7,18 @@ import json
 import logging
 import os
 import random
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from pywebpush import WebPushException, webpush
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -55,6 +57,7 @@ scheduler_task: Optional[asyncio.Task] = None
 PROMPT_MINUTE_HISTORY_DAYS = 1440
 SESSION_COOKIE_NAME = "momentary_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
+PROMPT_WINDOW_SECONDS = 60
 
 
 def load_minio_config() -> MinioConfig:
@@ -188,15 +191,15 @@ def _get_session_secret() -> bytes:
     return secret.encode("utf-8")
 
 
-def create_session_token(telegram_id: int) -> str:
+def create_session_token(claims: dict) -> str:
     issued_at = int(time.time())
-    payload = {
-        "telegram_id": telegram_id,
-        "iat": issued_at,
-        "exp": issued_at + SESSION_TTL_SECONDS,
-    }
-    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    sig = hmac.new(_get_session_secret(), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    payload = {**claims, "iat": issued_at, "exp": issued_at + SESSION_TTL_SECONDS}
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+    sig = hmac.new(
+        _get_session_secret(), payload_b64.encode("ascii"), hashlib.sha256
+    ).digest()
     sig_b64 = _b64url_encode(sig)
     return f"{payload_b64}.{sig_b64}"
 
@@ -217,6 +220,38 @@ def parse_and_verify_session(token: str) -> Optional[dict]:
         return payload
     except Exception:
         return None
+
+
+PBKDF2_ITERATIONS = 210_000
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+    )
+    return (
+        "pbkdf2_sha256$"
+        f"{PBKDF2_ITERATIONS}$"
+        f"{_b64url_encode(salt)}$"
+        f"{_b64url_encode(dk)}"
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, iters_raw, salt_b64, dk_b64 = stored.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iters = int(iters_raw)
+        salt = _b64url_decode(salt_b64)
+        expected = _b64url_decode(dk_b64)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iters
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
 
 
 def verify_telegram_login_payload(query_params: dict[str, str]) -> Optional[dict[str, str]]:
@@ -249,27 +284,68 @@ def verify_telegram_login_payload(query_params: dict[str, str]) -> Optional[dict
 
 async def send_daily_prompt() -> None:
     global db, bot_app
-    if not db or not bot_app:
+    if not db:
         return
 
-    # Notify all registered users at the same time.
-    users = db.get_users()
-    if not users:
-        logger.info("No registered users to notify.")
-        return
+    # Push notifications (Web Push)
+    vapid_public = os.getenv("VAPID_PUBLIC_KEY")
+    vapid_private = os.getenv("VAPID_PRIVATE_KEY")
+    vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")
+    push_click_url = os.getenv("PUSH_CLICK_URL", "/")
 
-    banned_ids = {int(row["telegram_id"]) for row in db.get_banned_users()}
-    message = "\U0001f4f8 Momentary time! Send a photo of what you're doing right now. You have 60 seconds."
-    for user in users:
-        if int(user["telegram_id"]) in banned_ids:
-            continue
-        try:
-            await bot_app.bot.send_message(chat_id=user["telegram_id"], text=message)
-        except Exception as exc:  # pragma: no cover - network issues
-            logger.warning("Failed to send prompt to %s: %s", user["telegram_id"], exc)
+    if vapid_public and vapid_private:
+        subs = db.list_push_subscriptions()
+        if subs:
+            payload = {
+                "title": "Momentary time!",
+                "body": "Send a photo of what you're doing right now. You have 60 seconds.",
+                "url": push_click_url,
+            }
+            for sub in subs:
+                if int(sub.get("is_banned", 0)) == 1:
+                    continue
+                subscription_info = {
+                    "endpoint": sub["endpoint"],
+                    "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]},
+                }
+                try:
+                    webpush(
+                        subscription_info=subscription_info,
+                        data=json.dumps(payload),
+                        vapid_private_key=vapid_private,
+                        vapid_claims={"sub": vapid_subject},
+                    )
+                except WebPushException as exc:  # pragma: no cover - network issues
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status in (404, 410):
+                        db.delete_push_subscription(sub["endpoint"])
+                    logger.warning("Web push failed for subscription %s: %s", sub["id"], exc)
+        else:
+            logger.info("No push subscriptions to notify.")
+    else:
+        logger.info("VAPID keys are not configured; skipping Web Push.")
+
+    # Telegram notifications (optional / legacy)
+    if bot_app:
+        users = db.get_users()
+        if users:
+            banned_ids = {int(row["telegram_id"]) for row in db.get_banned_users()}
+            message = "\U0001f4f8 Momentary time! Send a photo of what you're doing right now. You have 60 seconds."
+            for user in users:
+                if int(user["telegram_id"]) in banned_ids:
+                    continue
+                try:
+                    await bot_app.bot.send_message(chat_id=user["telegram_id"], text=message)
+                except Exception as exc:  # pragma: no cover - network issues
+                    logger.warning(
+                        "Failed to send Telegram prompt to %s: %s",
+                        user["telegram_id"],
+                        exc,
+                    )
 
     prompt_time = datetime.now(timezone.utc)
     db.set_last_prompt(prompt_time)
+    db.set_next_prompt(None)
     db.add_prompt_history(prompt_time)
     db.prune_prompt_history(PROMPT_MINUTE_HISTORY_DAYS)
 
@@ -653,14 +729,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("You are banned from this app.")
         return
 
-    # Only accept photos within 60 seconds of the last prompt.
+    # Only accept photos within the prompt window of the last prompt.
     last_prompt = db.get_last_prompt()
     if not last_prompt:
         await update.message.reply_text("No prompt is active yet. Check back later!")
         return
 
     now = datetime.now(timezone.utc)
-    if (now - last_prompt).total_seconds() > 60:
+    if (now - last_prompt).total_seconds() > PROMPT_WINDOW_SECONDS:
         await update.message.reply_text(
             "Sorry, you missed the 60-second window. Try again next time."
         )
@@ -699,6 +775,18 @@ async def on_startup() -> None:
 
     storage = MinioStorage(load_minio_config())
 
+    admin_username = (os.getenv("ADMIN_USERNAME") or "").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD") or ""
+    if admin_username and admin_password:
+        existing = db.get_account_by_username(admin_username.lower())
+        if not existing:
+            db.create_account(
+                username=admin_username.lower(),
+                password_hash=hash_password(admin_password),
+                is_admin=True,
+            )
+            logger.info("Bootstrapped admin account: %s", admin_username)
+
     scheduler_task = asyncio.create_task(scheduler_loop())
     asyncio.create_task(start_bot())
 
@@ -729,11 +817,122 @@ async def list_photos(telegram_id: int) -> JSONResponse:
         enriched.append(photo_data)
     return JSONResponse(content={"user": telegram_id, "photos": enriched})
 
+
+def normalize_username(raw: str) -> str:
+    return raw.strip().lower()
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PushKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionRequest(BaseModel):
+    endpoint: str
+    keys: PushKeys
+
+
+def get_cookie_samesite() -> str:
+    value = (os.getenv("COOKIE_SAMESITE") or "lax").strip().lower()
+    if value not in {"lax", "strict", "none"}:
+        return "lax"
+    return value
+
+
+def get_current_account_id(request: Request) -> Optional[int]:
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    payload = parse_and_verify_session(token)
+    if not payload:
+        return None
+    if payload.get("type") != "account":
+        return None
+    try:
+        return int(payload["account_id"])
+    except Exception:
+        return None
+
+
+@app.post("/auth/register")
+async def register(body: RegisterRequest) -> JSONResponse:
+    global db
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    if not db.are_registrations_open():
+        raise HTTPException(status_code=403, detail="Registrations are closed")
+
+    username = normalize_username(body.username)
+    password = body.password or ""
+    if len(username) < 3 or len(username) > 32:
+        raise HTTPException(status_code=400, detail="Username must be 3-32 chars")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
+
+    if db.get_account_by_username(username):
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    account_id = db.create_account(
+        username=username, password_hash=hash_password(password), is_admin=False
+    )
+    token = create_session_token(
+        {"type": "account", "account_id": account_id, "username": username}
+    )
+    resp = JSONResponse(content={"user_id": account_id, "username": username})
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite=get_cookie_samesite(),
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return resp
+
+
+@app.post("/auth/login")
+async def login(body: LoginRequest) -> JSONResponse:
+    global db
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    username = normalize_username(body.username)
+    account = db.get_account_by_username(username)
+    if not account or not verify_password(body.password or "", account["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if int(account.get("is_banned", 0)) == 1:
+        raise HTTPException(status_code=403, detail="Banned")
+
+    account_id = int(account["id"])
+    token = create_session_token(
+        {"type": "account", "account_id": account_id, "username": username}
+    )
+    resp = JSONResponse(content={"user_id": account_id, "username": username})
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite=get_cookie_samesite(),
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return resp
+
+
 @app.post("/auth/logout")
-async def logout() -> RedirectResponse:
-    response = RedirectResponse(url="/", status_code=303)
-    response.delete_cookie(key=SESSION_COOKIE_NAME)
-    return response
+async def logout() -> JSONResponse:
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(key=SESSION_COOKIE_NAME)
+    return resp
 
 
 @app.get("/auth/telegram/callback")
@@ -761,7 +960,9 @@ async def telegram_auth_callback(request: Request) -> RedirectResponse:
     db.upsert_user(telegram_id, payload.get("username"))
 
     try:
-        session_token = create_session_token(telegram_id)
+        session_token = create_session_token(
+            {"type": "telegram", "telegram_id": telegram_id}
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -771,7 +972,7 @@ async def telegram_auth_callback(request: Request) -> RedirectResponse:
         key=SESSION_COOKIE_NAME,
         value=session_token,
         httponly=True,
-        samesite="lax",
+        samesite=get_cookie_samesite(),
         secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
         max_age=SESSION_TTL_SECONDS,
     )
@@ -789,15 +990,158 @@ async def get_me(request: Request) -> JSONResponse:
     if not payload:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    telegram_id = int(payload["telegram_id"])
-    user = db.get_user_by_telegram(telegram_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    if payload.get("type") == "account":
+        account_id = int(payload["account_id"])
+        account = db.get_account_by_id(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="User not found")
+        return JSONResponse(
+            content={"user_id": account_id, "username": account.get("username")}
+        )
+
+    if payload.get("type") == "telegram":
+        telegram_id = int(payload["telegram_id"])
+        user = db.get_user_by_telegram(telegram_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return JSONResponse(
+            content={"user_id": telegram_id, "username": user.get("username")}
+        )
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+@app.get("/push/vapid-public-key")
+async def get_vapid_public_key() -> JSONResponse:
+    public = os.getenv("VAPID_PUBLIC_KEY")
+    if not public:
+        raise HTTPException(status_code=500, detail="VAPID_PUBLIC_KEY is not set")
+    return JSONResponse(content={"publicKey": public})
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(request: Request, body: PushSubscriptionRequest) -> JSONResponse:
+    global db
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    account_id = get_current_account_id(request)
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    account = db.get_account_by_id(account_id)
+    if not account or int(account.get("is_banned", 0)) == 1:
+        raise HTTPException(status_code=403, detail="Banned")
+
+    db.upsert_push_subscription(
+        account_id=account_id,
+        endpoint=body.endpoint,
+        p256dh=body.keys.p256dh,
+        auth=body.keys.auth,
+    )
+    return JSONResponse(content={"ok": True})
+
+
+@app.post("/admin/prompt/now")
+async def admin_prompt_now(request: Request) -> JSONResponse:
+    global db
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    account_id = get_current_account_id(request)
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    account = db.get_account_by_id(account_id)
+    if not account or int(account.get("is_admin", 0)) != 1:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    await send_daily_prompt()
+    return JSONResponse(content={"ok": True})
+
+
+@app.get("/prompt/status")
+async def prompt_status() -> JSONResponse:
+    global db
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    last_prompt = db.get_last_prompt()
+    now = datetime.now(timezone.utc)
+    active = False
+    expires_at: Optional[datetime] = None
+    seconds_remaining = 0
+    if last_prompt:
+        if last_prompt.tzinfo is None:
+            last_prompt = last_prompt.replace(tzinfo=timezone.utc)
+        expires_at = last_prompt + timedelta(seconds=PROMPT_WINDOW_SECONDS)
+        seconds_remaining = int((expires_at - now).total_seconds())
+        active = seconds_remaining > 0
+        if seconds_remaining < 0:
+            seconds_remaining = 0
 
     return JSONResponse(
         content={
-            "telegram_id": user["telegram_id"],
-            "username": user.get("username"),
-            "created_at": user.get("created_at"),
+            "active": active,
+            "lastPrompt": last_prompt.isoformat() if last_prompt else None,
+            "expiresAt": expires_at.isoformat() if expires_at else None,
+            "secondsRemaining": seconds_remaining,
         }
     )
+
+
+@app.post("/photos/upload")
+async def upload_photo(request: Request, file: UploadFile = File(...)) -> JSONResponse:
+    global db, storage
+    if not db or not storage:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+
+    account_id = get_current_account_id(request)
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    account = db.get_account_by_id(account_id)
+    if not account or int(account.get("is_banned", 0)) == 1:
+        raise HTTPException(status_code=403, detail="Banned")
+
+    last_prompt = db.get_last_prompt()
+    if not last_prompt:
+        raise HTTPException(status_code=403, detail="No prompt is active")
+    now = datetime.now(timezone.utc)
+    if last_prompt.tzinfo is None:
+        last_prompt = last_prompt.replace(tzinfo=timezone.utc)
+    if (now - last_prompt).total_seconds() > PROMPT_WINDOW_SECONDS:
+        raise HTTPException(status_code=403, detail="Prompt window has expired")
+
+    content_type = file.content_type or "application/octet-stream"
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload")
+
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+    timestamp = datetime.now(timezone.utc)
+    object_key = f"account_{account_id}/{timestamp.strftime('%Y%m%d_%H%M%S')}{ext}"
+
+    storage.upload_photo(object_key, data, content_type=content_type)
+    db.add_account_photo(account_id, timestamp.isoformat(), object_key)
+
+    return JSONResponse(content={"ok": True})
+
+
+@app.get("/photos")
+async def list_my_photos(request: Request) -> JSONResponse:
+    global db, storage
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    account_id = get_current_account_id(request)
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    photos = db.list_account_photos(account_id)
+    enriched = []
+    for photo in photos:
+        photo_data = dict(photo)
+        if storage:
+            photo_data["url"] = storage.get_presigned_url(photo["object_key"])
+        enriched.append(photo_data)
+    return JSONResponse(content={"photos": enriched})
